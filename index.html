@@ -32,37 +32,55 @@
 </header>
 <textarea id="t" placeholder="Пиши тут — на втором устройстве появится через ~1 сек"></textarea>
 <script>
-  const BLOB = "019e30b8-f56d-72f5-88f0-2d3e0fa451d3";
-  const URL_ = "https://jsonblob.com/api/jsonBlob/" + BLOB;
+  // Уникальный топик — кто знает имя, тот видит текст.
+  const TOPIC = "clpbd-kim-a7f3e2d8b1c9k4m7";
+  const POST_URL = "https://ntfy.sh/" + TOPIC;
+  const POLL_URL = "https://ntfy.sh/" + TOPIC + "/json?poll=1";
+
   const t = document.getElementById("t");
   const dot = document.getElementById("dot");
   const status = document.getElementById("status");
   const info = document.getElementById("info");
 
-  let lastSeen = "";        // последний known-серверный текст
-  let lastSent = "";        // последнее, что мы отправили
-  let dirty = false;        // есть несохранённые правки
-  let saving = false;
-  let userTypingUntil = 0;  // не пуллим во время активного ввода
+  let lastApplied = "";      // последнее значение, синхронизированное с сервером (что мы видели или отправили)
+  let pushTimer = null;      // debounce-таймер для записи
+  let pushing = false;
+  let userTypingUntil = 0;
 
   function setDot(cls, msg) {
     dot.className = "dot " + cls;
     if (msg) status.textContent = msg;
   }
 
+  // Сообщение в ntfy = JSON: {"v": "текст"} (так умеем хранить пустую строку)
+  function encode(text) { return JSON.stringify({ v: text }); }
+  function decode(s) {
+    try { const j = JSON.parse(s); if (j && typeof j.v === "string") return j.v; } catch {}
+    return null;
+  }
+
   async function pull() {
-    if (saving) return;
-    if (Date.now() < userTypingUntil) return;     // не перетираем то, что юзер сейчас печатает
+    if (pushing) return;
+    if (Date.now() < userTypingUntil) return;
     try {
-      const r = await fetch(URL_, { cache: "no-store" });
+      const r = await fetch(POLL_URL, { cache: "no-store" });
       if (!r.ok) throw new Error(r.status);
-      const j = await r.json();
-      const val = (j && typeof j.text === "string") ? j.text : "";
-      if (val !== lastSeen) {
-        lastSeen = val;
-        if (!dirty && t.value !== val) {
-          t.value = val;
-        }
+      const txt = await r.text();
+      const lines = txt.split("\n").map(s => s.trim()).filter(Boolean);
+      // берём последнее декодируемое сообщение
+      let latest = null;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const msg = JSON.parse(lines[i]);
+          if (msg && msg.event === "message" && typeof msg.message === "string") {
+            const v = decode(msg.message);
+            if (v !== null) { latest = v; break; }
+          }
+        } catch {}
+      }
+      if (latest !== null && latest !== lastApplied) {
+        lastApplied = latest;
+        if (t.value !== latest) t.value = latest;
       }
       setDot("ok", "синхронизировано");
       info.textContent = new Date().toLocaleTimeString();
@@ -71,35 +89,38 @@
     }
   }
 
-  async function push() {
-    if (!dirty) return;
-    if (saving) return;
-    saving = true;
-    setDot("busy", "сохранение…");
+  async function pushNow() {
+    if (pushing) return;
     const payload = t.value;
+    if (payload === lastApplied) return;
+    pushing = true;
+    setDot("busy", "сохранение…");
     try {
-      const r = await fetch(URL_, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json", "Accept": "application/json" },
-        body: JSON.stringify({ text: payload })
+      const r = await fetch(POST_URL, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain" },
+        body: encode(payload)
       });
       if (!r.ok) throw new Error(r.status);
-      lastSent = payload;
-      lastSeen = payload;
-      dirty = (t.value !== lastSent);
+      lastApplied = payload;
       setDot("ok", "сохранено");
       info.textContent = new Date().toLocaleTimeString();
     } catch (e) {
       setDot("err", "ошибка записи");
     } finally {
-      saving = false;
+      pushing = false;
     }
   }
 
+  function schedulePush() {
+    clearTimeout(pushTimer);
+    pushTimer = setTimeout(pushNow, 600); // debounce 600мс после последнего ввода
+  }
+
   t.addEventListener("input", () => {
-    dirty = (t.value !== lastSent);
-    userTypingUntil = Date.now() + 1200;
+    userTypingUntil = Date.now() + 1500;
     setDot("busy", "печатает…");
+    schedulePush();
   });
 
   document.getElementById("copy").addEventListener("click", async () => {
@@ -115,12 +136,13 @@
   document.getElementById("clear").addEventListener("click", () => {
     if (!confirm("Очистить текст на обоих устройствах?")) return;
     t.value = "";
-    dirty = true;
-    push();
+    pushNow();
   });
 
+  // Перед закрытием попытаемся успеть отправить последнее
+  window.addEventListener("beforeunload", () => { if (t.value !== lastApplied) navigator.sendBeacon(POST_URL, encode(t.value)); });
+
   setInterval(pull, 1500);
-  setInterval(push, 1200);
   pull();
 </script>
 </body>

@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>Буфер</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  body { display: flex; flex-direction: column; background: #111; color: #eee; }
+  header { display: flex; gap: 8px; align-items: center; padding: 8px 12px; background: #1c1c1c; border-bottom: 1px solid #333; font-size: 14px; }
+  header .dot { width: 10px; height: 10px; border-radius: 50%; background: #666; transition: background .25s; }
+  header .dot.ok { background: #2ecc71; }
+  header .dot.err { background: #e74c3c; }
+  header .dot.busy { background: #f1c40f; }
+  header .spacer { flex: 1; }
+  header button { background: #2d2d2d; color: #eee; border: 1px solid #444; padding: 6px 12px; border-radius: 6px; font-size: 14px; cursor: pointer; }
+  header button:active { background: #3d3d3d; }
+  textarea { flex: 1; width: 100%; resize: none; border: none; outline: none; padding: 14px; font-size: 17px; line-height: 1.4; background: #181818; color: #eee; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .info { font-size: 12px; opacity: .6; }
+</style>
+</head>
+<body>
+<header>
+  <div class="dot" id="dot"></div>
+  <span id="status">подключение…</span>
+  <span class="info" id="info"></span>
+  <span class="spacer"></span>
+  <button id="copy">Копировать</button>
+  <button id="clear">Очистить</button>
+</header>
+<textarea id="t" placeholder="Пиши тут — на втором устройстве появится через ~1 сек"></textarea>
+<script>
+  const BLOB = "019e30b8-f56d-72f5-88f0-2d3e0fa451d3";
+  const URL_ = "https://jsonblob.com/api/jsonBlob/" + BLOB;
+  const t = document.getElementById("t");
+  const dot = document.getElementById("dot");
+  const status = document.getElementById("status");
+  const info = document.getElementById("info");
+
+  let lastSeen = "";        // последний known-серверный текст
+  let lastSent = "";        // последнее, что мы отправили
+  let dirty = false;        // есть несохранённые правки
+  let saving = false;
+  let userTypingUntil = 0;  // не пуллим во время активного ввода
+
+  function setDot(cls, msg) {
+    dot.className = "dot " + cls;
+    if (msg) status.textContent = msg;
+  }
+
+  async function pull() {
+    if (saving) return;
+    if (Date.now() < userTypingUntil) return;     // не перетираем то, что юзер сейчас печатает
+    try {
+      const r = await fetch(URL_, { cache: "no-store" });
+      if (!r.ok) throw new Error(r.status);
+      const j = await r.json();
+      const val = (j && typeof j.text === "string") ? j.text : "";
+      if (val !== lastSeen) {
+        lastSeen = val;
+        if (!dirty && t.value !== val) {
+          t.value = val;
+        }
+      }
+      setDot("ok", "синхронизировано");
+      info.textContent = new Date().toLocaleTimeString();
+    } catch (e) {
+      setDot("err", "ошибка чтения");
+    }
+  }
+
+  async function push() {
+    if (!dirty) return;
+    if (saving) return;
+    saving = true;
+    setDot("busy", "сохранение…");
+    const payload = t.value;
+    try {
+      const r = await fetch(URL_, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", "Accept": "application/json" },
+        body: JSON.stringify({ text: payload })
+      });
+      if (!r.ok) throw new Error(r.status);
+      lastSent = payload;
+      lastSeen = payload;
+      dirty = (t.value !== lastSent);
+      setDot("ok", "сохранено");
+      info.textContent = new Date().toLocaleTimeString();
+    } catch (e) {
+      setDot("err", "ошибка записи");
+    } finally {
+      saving = false;
+    }
+  }
+
+  t.addEventListener("input", () => {
+    dirty = (t.value !== lastSent);
+    userTypingUntil = Date.now() + 1200;
+    setDot("busy", "печатает…");
+  });
+
+  document.getElementById("copy").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(t.value);
+      setDot("ok", "скопировано в буфер");
+    } catch {
+      t.select(); document.execCommand("copy");
+      setDot("ok", "скопировано");
+    }
+  });
+
+  document.getElementById("clear").addEventListener("click", () => {
+    if (!confirm("Очистить текст на обоих устройствах?")) return;
+    t.value = "";
+    dirty = true;
+    push();
+  });
+
+  setInterval(pull, 1500);
+  setInterval(push, 1200);
+  pull();
+</script>
+</body>
+</html>

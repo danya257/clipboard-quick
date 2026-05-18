@@ -9,16 +9,25 @@
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   body { display: flex; flex-direction: column; background: #111; color: #eee; }
-  header { display: flex; gap: 8px; align-items: center; padding: 8px 12px; background: #1c1c1c; border-bottom: 1px solid #333; font-size: 14px; }
+  header { display: flex; gap: 8px; align-items: center; padding: 8px 12px; background: #1c1c1c; border-bottom: 1px solid #333; font-size: 14px; flex-wrap: wrap; }
   header .dot { width: 10px; height: 10px; border-radius: 50%; background: #666; transition: background .25s; }
   header .dot.ok { background: #2ecc71; }
   header .dot.err { background: #e74c3c; }
   header .dot.busy { background: #f1c40f; }
   header .spacer { flex: 1; }
-  header button { background: #2d2d2d; color: #eee; border: 1px solid #444; padding: 6px 12px; border-radius: 6px; font-size: 14px; cursor: pointer; }
-  header button:active { background: #3d3d3d; }
-  textarea { flex: 1; width: 100%; resize: none; border: none; outline: none; padding: 14px; font-size: 17px; line-height: 1.4; background: #181818; color: #eee; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  header button, header label.btn { background: #2d2d2d; color: #eee; border: 1px solid #444; padding: 6px 12px; border-radius: 6px; font-size: 14px; cursor: pointer; display: inline-block; }
+  header button:active, header label.btn:active { background: #3d3d3d; }
+  textarea { flex: 1 1 50%; width: 100%; resize: none; border: none; outline: none; padding: 14px; font-size: 17px; line-height: 1.4; background: #181818; color: #eee; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; min-height: 120px; }
   .info { font-size: 12px; opacity: .6; }
+  #photoBox { border-top: 1px solid #333; background: #141414; display: flex; flex-direction: column; min-height: 160px; max-height: 55vh; }
+  #photoBar { display: flex; gap: 8px; align-items: center; padding: 8px 12px; font-size: 13px; flex-wrap: wrap; }
+  #photoBar .spacer { flex: 1; }
+  #photoBar button { background: #2d2d2d; color: #eee; border: 1px solid #444; padding: 5px 10px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+  #photoBar button:disabled { opacity: .4; cursor: not-allowed; }
+  #photoView { flex: 1; display: flex; align-items: center; justify-content: center; overflow: auto; padding: 8px; }
+  #photoView img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 4px; }
+  #photoView .empty { opacity: .4; font-size: 13px; }
+  #fileIn { display: none; }
 </style>
 </head>
 <body>
@@ -27,12 +36,27 @@
   <span id="status">подключение…</span>
   <span class="info" id="info"></span>
   <span class="spacer"></span>
-  <button id="copy">Копировать</button>
+  <label class="btn" for="fileIn">Загрузить фото</label>
+  <input type="file" id="fileIn" accept="image/*" />
+  <button id="copy">Копировать текст</button>
   <button id="clear">Очистить</button>
 </header>
+
 <textarea id="t" placeholder="Пиши тут — на втором устройстве появится через ~1 сек"></textarea>
+
+<div id="photoBox">
+  <div id="photoBar">
+    <span id="photoStatus" class="info">фото нет</span>
+    <span class="spacer"></span>
+    <button id="photoCopy" disabled>Копировать фото</button>
+    <button id="photoDownload" disabled>Скачать</button>
+    <button id="photoOpen" disabled>Открыть</button>
+  </div>
+  <div id="photoView"><span class="empty">фото нет — нажми «Загрузить фото»</span></div>
+</div>
+
 <script>
-  // Уникальный топик — кто знает имя, тот видит текст.
+  // Уникальный топик — кто знает имя, тот видит данные.
   const TOPIC = "clpbd-kim-a7f3e2d8b1c9k4m7";
   const POST_URL = "https://ntfy.sh/" + TOPIC;
   const POLL_URL = "https://ntfy.sh/" + TOPIC + "/json?poll=1";
@@ -41,10 +65,18 @@
   const dot = document.getElementById("dot");
   const status = document.getElementById("status");
   const info = document.getElementById("info");
+  const fileIn = document.getElementById("fileIn");
+  const photoView = document.getElementById("photoView");
+  const photoStatus = document.getElementById("photoStatus");
+  const photoCopyBtn = document.getElementById("photoCopy");
+  const photoDownloadBtn = document.getElementById("photoDownload");
+  const photoOpenBtn = document.getElementById("photoOpen");
 
-  let lastApplied = "";      // последнее значение, синхронизированное с сервером (что мы видели или отправили)
-  let pushTimer = null;      // debounce-таймер для записи
+  let lastTextApplied = "";
+  let lastImageUrl = "";
+  let pushTimer = null;
   let pushing = false;
+  let uploading = false;
   let userTypingUntil = 0;
 
   function setDot(cls, msg) {
@@ -52,36 +84,48 @@
     if (msg) status.textContent = msg;
   }
 
-  // Сообщение в ntfy = JSON: {"v": "текст"} (так умеем хранить пустую строку)
-  function encode(text) { return JSON.stringify({ v: text }); }
-  function decode(s) {
+  // Текстовое сообщение = JSON {v: "..."}; фото-сообщение = ntfy attachment.
+  function encodeText(text) { return JSON.stringify({ v: text }); }
+  function decodeText(s) {
     try { const j = JSON.parse(s); if (j && typeof j.v === "string") return j.v; } catch {}
     return null;
   }
 
   async function pull() {
-    if (pushing) return;
+    if (pushing || uploading) return;
     if (Date.now() < userTypingUntil) return;
     try {
       const r = await fetch(POLL_URL, { cache: "no-store" });
       if (!r.ok) throw new Error(r.status);
       const txt = await r.text();
       const lines = txt.split("\n").map(s => s.trim()).filter(Boolean);
-      // берём последнее декодируемое сообщение
-      let latest = null;
+
+      // Сканируем историю с конца — берём последний текст и последнее фото независимо.
+      let latestText = null;
+      let latestImage = null;
       for (let i = lines.length - 1; i >= 0; i--) {
-        try {
-          const msg = JSON.parse(lines[i]);
-          if (msg && msg.event === "message" && typeof msg.message === "string") {
-            const v = decode(msg.message);
-            if (v !== null) { latest = v; break; }
-          }
-        } catch {}
+        let msg;
+        try { msg = JSON.parse(lines[i]); } catch { continue; }
+        if (!msg || msg.event !== "message") continue;
+
+        if (latestImage === null && msg.attachment && msg.attachment.url) {
+          latestImage = msg.attachment.url;
+        }
+        if (latestText === null && typeof msg.message === "string") {
+          const v = decodeText(msg.message);
+          if (v !== null) latestText = v;
+        }
+        if (latestText !== null && latestImage !== null) break;
       }
-      if (latest !== null && latest !== lastApplied) {
-        lastApplied = latest;
-        if (t.value !== latest) t.value = latest;
+
+      if (latestText !== null && latestText !== lastTextApplied) {
+        lastTextApplied = latestText;
+        if (t.value !== latestText) t.value = latestText;
       }
+      if (latestImage !== null && latestImage !== lastImageUrl) {
+        showImage(latestImage);
+      }
+
       setDot("ok", "синхронизировано");
       info.textContent = new Date().toLocaleTimeString();
     } catch (e) {
@@ -89,20 +133,20 @@
     }
   }
 
-  async function pushNow() {
+  async function pushText() {
     if (pushing) return;
     const payload = t.value;
-    if (payload === lastApplied) return;
+    if (payload === lastTextApplied) return;
     pushing = true;
     setDot("busy", "сохранение…");
     try {
       const r = await fetch(POST_URL, {
         method: "POST",
         headers: { "Content-Type": "text/plain" },
-        body: encode(payload)
+        body: encodeText(payload)
       });
       if (!r.ok) throw new Error(r.status);
-      lastApplied = payload;
+      lastTextApplied = payload;
       setDot("ok", "сохранено");
       info.textContent = new Date().toLocaleTimeString();
     } catch (e) {
@@ -112,15 +156,99 @@
     }
   }
 
-  function schedulePush() {
+  function scheduleTextPush() {
     clearTimeout(pushTimer);
-    pushTimer = setTimeout(pushNow, 600); // debounce 600мс после последнего ввода
+    pushTimer = setTimeout(pushText, 600);
   }
 
+  // Сжатие фото: ресайз до 1600px по длинной стороне, JPEG q=0.82
+  async function compressImage(file) {
+    const MAX_DIM = 1600;
+    const QUALITY = 0.82;
+    const img = await new Promise((resolve, reject) => {
+      const im = new Image();
+      im.onload = () => resolve(im);
+      im.onerror = reject;
+      im.src = URL.createObjectURL(file);
+    });
+    const scale = Math.min(1, MAX_DIM / Math.max(img.width, img.height));
+    const w = Math.round(img.width * scale);
+    const h = Math.round(img.height * scale);
+    const canvas = document.createElement("canvas");
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0, w, h);
+    URL.revokeObjectURL(img.src);
+    const blob = await new Promise(res => canvas.toBlob(res, "image/jpeg", QUALITY));
+    if (!blob) throw new Error("compress failed");
+    return blob;
+  }
+
+  async function uploadFile(file) {
+    if (uploading) return;
+    if (!file) return;
+    uploading = true;
+    setDot("busy", "сжатие фото…");
+    photoStatus.textContent = "сжатие…";
+    try {
+      let body = file;
+      let filename = file.name || "photo.jpg";
+      // Сжимаем все изображения, кроме совсем маленьких
+      if (file.type.startsWith("image/") && file.size > 200 * 1024) {
+        body = await compressImage(file);
+        filename = (filename.replace(/\.[^.]+$/, "")) + ".jpg";
+      }
+      const sizeKb = Math.round(body.size / 1024);
+      // ntfy.sh лимит 2 MiB
+      if (body.size > 2 * 1024 * 1024) {
+        throw new Error("файл всё ещё " + sizeKb + " КБ (лимит ~2048)");
+      }
+      setDot("busy", "загрузка " + sizeKb + " КБ…");
+      photoStatus.textContent = "загрузка " + sizeKb + " КБ…";
+      const r = await fetch(POST_URL, {
+        method: "PUT",
+        headers: {
+          "Content-Type": body.type || "application/octet-stream",
+          "Filename": filename
+        },
+        body
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const msg = await r.json();
+      if (msg && msg.attachment && msg.attachment.url) {
+        showImage(msg.attachment.url);
+        setDot("ok", "фото загружено");
+        info.textContent = new Date().toLocaleTimeString();
+      } else {
+        throw new Error("нет attachment в ответе");
+      }
+    } catch (e) {
+      setDot("err", "ошибка фото");
+      photoStatus.textContent = "ошибка: " + (e.message || e);
+    } finally {
+      uploading = false;
+      fileIn.value = "";
+    }
+  }
+
+  function showImage(url) {
+    lastImageUrl = url;
+    photoView.innerHTML = "";
+    const img = document.createElement("img");
+    img.src = url;
+    img.alt = "фото";
+    photoView.appendChild(img);
+    photoStatus.textContent = "фото загружено";
+    photoCopyBtn.disabled = false;
+    photoDownloadBtn.disabled = false;
+    photoOpenBtn.disabled = false;
+  }
+
+  // События
   t.addEventListener("input", () => {
     userTypingUntil = Date.now() + 1500;
     setDot("busy", "печатает…");
-    schedulePush();
+    scheduleTextPush();
   });
 
   document.getElementById("copy").addEventListener("click", async () => {
@@ -136,11 +264,71 @@
   document.getElementById("clear").addEventListener("click", () => {
     if (!confirm("Очистить текст на обоих устройствах?")) return;
     t.value = "";
-    pushNow();
+    pushText();
   });
 
-  // Перед закрытием попытаемся успеть отправить последнее
-  window.addEventListener("beforeunload", () => { if (t.value !== lastApplied) navigator.sendBeacon(POST_URL, encode(t.value)); });
+  fileIn.addEventListener("change", () => {
+    const file = fileIn.files && fileIn.files[0];
+    if (file) uploadFile(file);
+  });
+
+  // Drag & drop фото в любое место страницы
+  document.addEventListener("dragover", e => { e.preventDefault(); });
+  document.addEventListener("drop", e => {
+    e.preventDefault();
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f && f.type.startsWith("image/")) uploadFile(f);
+  });
+
+  // Вставка фото из буфера обмена (Ctrl+V)
+  document.addEventListener("paste", e => {
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    for (const it of items) {
+      if (it.kind === "file" && it.type.startsWith("image/")) {
+        const f = it.getAsFile();
+        if (f) { e.preventDefault(); uploadFile(f); return; }
+      }
+    }
+  });
+
+  // Кнопки на фото
+  photoDownloadBtn.addEventListener("click", () => {
+    if (!lastImageUrl) return;
+    const a = document.createElement("a");
+    a.href = lastImageUrl;
+    a.download = "photo.jpg";
+    a.target = "_blank";
+    document.body.appendChild(a); a.click(); a.remove();
+  });
+  photoOpenBtn.addEventListener("click", () => {
+    if (lastImageUrl) window.open(lastImageUrl, "_blank");
+  });
+  photoCopyBtn.addEventListener("click", async () => {
+    if (!lastImageUrl) return;
+    try {
+      const r = await fetch(lastImageUrl);
+      const blob = await r.blob();
+      // ClipboardItem требует PNG для системного буфера — конвертируем через canvas
+      const img = await new Promise((resolve, reject) => {
+        const im = new Image(); im.crossOrigin = "anonymous";
+        im.onload = () => resolve(im); im.onerror = reject; im.src = URL.createObjectURL(blob);
+      });
+      const cv = document.createElement("canvas");
+      cv.width = img.naturalWidth; cv.height = img.naturalHeight;
+      cv.getContext("2d").drawImage(img, 0, 0);
+      const pngBlob = await new Promise(res => cv.toBlob(res, "image/png"));
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": pngBlob })]);
+      setDot("ok", "фото в буфере");
+    } catch (e) {
+      setDot("err", "не удалось скопировать (попробуй «Открыть» → правый клик)");
+    }
+  });
+
+  // Перед закрытием досылаем последний текст
+  window.addEventListener("beforeunload", () => {
+    if (t.value !== lastTextApplied) navigator.sendBeacon(POST_URL, encodeText(t.value));
+  });
 
   setInterval(pull, 1500);
   pull();
